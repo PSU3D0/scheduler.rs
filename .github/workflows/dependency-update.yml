@@ -27,7 +27,7 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml
           git commit -m "chore: update Cargo dependencies" || echo "No changes to commit"
 
       - name: Push changes
