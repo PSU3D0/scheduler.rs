@@ -61,10 +61,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a schedule with an inline closure
     println!("Adding schedule with inline closure...");
+    #[cfg(not(feature = "async"))]
     scheduler
         .every(Duration::from_secs(3))
         .with_name("inline_closure")
         .execute(move |event| {
+            println!(
+                "Inline closure executed for {} at {:?}",
+                event.schedule_name,
+                start.clone().elapsed()
+            );
+        })?;
+
+    #[cfg(feature = "async")]
+    scheduler
+        .every(Duration::from_secs(3))
+        .with_name("inline_closure")
+        .execute(move |event| async move {
             println!(
                 "Inline closure executed for {} at {:?}",
                 event.schedule_name,

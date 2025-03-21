@@ -919,7 +919,7 @@ impl<'a> ScheduleBuilder<'a> {
     /// Execute a closure when this schedule fires, with async support.
     pub fn execute<F, Fut>(self, handler: F) -> Result<String, SchedulerError>
     where
-        F: Fn(TickEvent) -> Fut + Send + Sync + 'static,
+        F: Fn(TickEvent) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         use crate::async_support::AsyncClosureHandler;
@@ -1045,6 +1045,12 @@ pub mod async_support {
         /// Freeze the scheduler state for persistence.
         pub fn freeze(&self) -> Result<SchedulerState, SchedulerError> {
             self.scheduler.freeze()
+        }
+    }
+
+    impl Default for AsyncScheduler {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
