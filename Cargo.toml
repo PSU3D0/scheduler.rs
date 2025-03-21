@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "A lightweight Rust library for managing operations across multiple time scales"
 license = "MIT"
+authors = ["PSU3D0"]
+repository = "https://github.com/PSU3D0/scheduler.rs"
+readme = "README.md"
+keywords = ["scheduler", "cron", "timing", "async"]
+categories = ["concurrency", "date-and-time"]
 
 [dependencies]
 serde = { version = "^1.0", features = ["derive"] }
