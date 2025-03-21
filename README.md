@@ -134,10 +134,10 @@ Add to your Cargo.toml:
 
 ```toml
 [dependencies]
-schedule_rs = "0.1.0"
+schedules = "0.2.0"
 
 # For async support:
-schedule_rs = { version = "0.1.0", features = ["async"] }
+schedules = { version = "0.2.0", features = ["async"] }
 ```
 
 ## 📄 License

@@ -2,7 +2,7 @@
 // cargo run --example async --features async
 
 #[cfg(feature = "async")]
-use schedule_rs::async_support::AsyncScheduler;
+use schedules::async_support::AsyncScheduler;
 
 #[cfg(feature = "async")]
 use std::time::Duration;

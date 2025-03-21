@@ -1,4 +1,4 @@
-use schedule_rs::{CallbackHandler, Scheduler, SchedulerConfig, TickEvent};
+use schedules::{CallbackHandler, Scheduler, SchedulerConfig, TickEvent};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

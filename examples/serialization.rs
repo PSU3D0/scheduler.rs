@@ -1,4 +1,4 @@
-use schedule_rs::{CallbackHandler, Scheduler, SchedulerState, TickEvent};
+use schedules::{CallbackHandler, Scheduler, SchedulerState, TickEvent};
 use std::fs;
 use std::future::Future;
 use std::path::Path;
