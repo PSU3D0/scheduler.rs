@@ -1,0 +1,36 @@
+name: Update Cargo Dependencies
+
+on:
+  schedule:
+    - cron: "0 0 * * *"  # runs daily at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  update-deps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit
+
+      - name: Upgrade dependencies (pin minor versions)
+        run: cargo upgrade --pinned
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: update Cargo dependencies" || echo "No changes to commit"
+
+      - name: Push changes
+        uses: ad-m/github-push-action@v0.6.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
