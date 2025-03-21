@@ -9,6 +9,118 @@ mod calculator;
 pub use builder::CalendarScheduleBuilder;
 pub use calculator::calculate_next_calendar_time;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Copy, PartialOrd, Ord)]
+pub enum Month {
+    January = 1,
+    February = 2,
+    March = 3,
+    April = 4,
+    May = 5,
+    June = 6,
+    July = 7,
+    August = 8,
+    September = 9,
+    October = 10,
+    November = 11,
+    December = 12,
+}
+
+macro_rules! impl_from_for_month {
+    ($($t:ty),*) => {
+        $(
+            impl From<$t> for Month {
+                fn from(value: $t) -> Self {
+                    match value {
+                        1 => Month::January,
+                        2 => Month::February,
+                        3 => Month::March,
+                        4 => Month::April,
+                        5 => Month::May,
+                        6 => Month::June,
+                        7 => Month::July,
+                        8 => Month::August,
+                        9 => Month::September,
+                        10 => Month::October,
+                        11 => Month::November,
+                        12 => Month::December,
+                        _ => panic!("Invalid month value: {}", value),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+// Implement From for all numeric types
+impl_from_for_month!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize);
+
+impl fmt::Display for Month {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Month::January => write!(f, "January"),
+            Month::February => write!(f, "February"),
+            Month::March => write!(f, "March"),
+            Month::April => write!(f, "April"),
+            Month::May => write!(f, "May"),
+            Month::June => write!(f, "June"),
+            Month::July => write!(f, "July"),
+            Month::August => write!(f, "August"),
+            Month::September => write!(f, "September"),
+            Month::October => write!(f, "October"),
+            Month::November => write!(f, "November"),
+            Month::December => write!(f, "December"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Copy, PartialOrd, Ord)]
+pub enum DayOfWeek {
+    Sunday = 0,
+    Monday = 1,
+    Tuesday = 2,
+    Wednesday = 3,
+    Thursday = 4,
+    Friday = 5,
+    Saturday = 6,
+}
+
+impl fmt::Display for DayOfWeek {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DayOfWeek::Sunday => write!(f, "Sunday"),
+            DayOfWeek::Monday => write!(f, "Monday"),
+            DayOfWeek::Tuesday => write!(f, "Tuesday"),
+            DayOfWeek::Wednesday => write!(f, "Wednesday"),
+            DayOfWeek::Thursday => write!(f, "Thursday"),
+            DayOfWeek::Friday => write!(f, "Friday"),
+            DayOfWeek::Saturday => write!(f, "Saturday"),
+        }
+    }
+}
+
+macro_rules! impl_from_for_day_of_week {
+    ($($t:ty),*) => {
+        $(
+            impl From<$t> for DayOfWeek {
+                fn from(value: $t) -> Self {
+                    match value {
+                        0 => DayOfWeek::Sunday,
+                        1 => DayOfWeek::Monday,
+                        2 => DayOfWeek::Tuesday,
+                        3 => DayOfWeek::Wednesday,
+                        4 => DayOfWeek::Thursday,
+                        5 => DayOfWeek::Friday,
+                        6 => DayOfWeek::Saturday,
+                        _ => panic!("Invalid day of week value: {}", value),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+impl_from_for_day_of_week!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize);
+
 /// A unit of time used for calendar-based schedules
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TimeUnit {
@@ -16,13 +128,13 @@ pub enum TimeUnit {
     TimeOfDay(NaiveTime),
 
     /// Day of week (0-6, where 0 is Sunday)
-    DayOfWeek(u8),
+    DayOfWeek(DayOfWeek),
 
     /// Day of month (1-31)
     DayOfMonth(u8),
 
     /// Month of year (1-12)
-    Month(u8),
+    Month(Month),
 
     /// Specific date (YYYY-MM-DD)
     Date(NaiveDate),
@@ -32,38 +144,9 @@ impl fmt::Display for TimeUnit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TimeUnit::TimeOfDay(time) => write!(f, "at {}", time),
-            TimeUnit::DayOfWeek(day) => {
-                let day_name = match day {
-                    0 => "Sunday",
-                    1 => "Monday",
-                    2 => "Tuesday",
-                    3 => "Wednesday",
-                    4 => "Thursday",
-                    5 => "Friday",
-                    6 => "Saturday",
-                    _ => "Invalid day",
-                };
-                write!(f, "on {}", day_name)
-            }
+            TimeUnit::DayOfWeek(day) => write!(f, "on {}", day),
             TimeUnit::DayOfMonth(day) => write!(f, "on day {} of month", day),
-            TimeUnit::Month(month) => {
-                let month_name = match month {
-                    1 => "January",
-                    2 => "February",
-                    3 => "March",
-                    4 => "April",
-                    5 => "May",
-                    6 => "June",
-                    7 => "July",
-                    8 => "August",
-                    9 => "September",
-                    10 => "October",
-                    11 => "November",
-                    12 => "December",
-                    _ => "Invalid month",
-                };
-                write!(f, "in {}", month_name)
-            }
+            TimeUnit::Month(month) => write!(f, "in {}", month),
             TimeUnit::Date(date) => write!(f, "on {}", date),
         }
     }
@@ -180,13 +263,13 @@ pub fn parse_time(time_str: &str) -> Result<NaiveTime, String> {
 }
 
 /// Constants for days of the week
-pub const SUNDAY: TimeUnit = TimeUnit::DayOfWeek(0);
-pub const MONDAY: TimeUnit = TimeUnit::DayOfWeek(1);
-pub const TUESDAY: TimeUnit = TimeUnit::DayOfWeek(2);
-pub const WEDNESDAY: TimeUnit = TimeUnit::DayOfWeek(3);
-pub const THURSDAY: TimeUnit = TimeUnit::DayOfWeek(4);
-pub const FRIDAY: TimeUnit = TimeUnit::DayOfWeek(5);
-pub const SATURDAY: TimeUnit = TimeUnit::DayOfWeek(6);
+pub const SUNDAY: TimeUnit = TimeUnit::DayOfWeek(DayOfWeek::Sunday);
+pub const MONDAY: TimeUnit = TimeUnit::DayOfWeek(DayOfWeek::Monday);
+pub const TUESDAY: TimeUnit = TimeUnit::DayOfWeek(DayOfWeek::Tuesday);
+pub const WEDNESDAY: TimeUnit = TimeUnit::DayOfWeek(DayOfWeek::Wednesday);
+pub const THURSDAY: TimeUnit = TimeUnit::DayOfWeek(DayOfWeek::Thursday);
+pub const FRIDAY: TimeUnit = TimeUnit::DayOfWeek(DayOfWeek::Friday);
+pub const SATURDAY: TimeUnit = TimeUnit::DayOfWeek(DayOfWeek::Saturday);
 
 /// Extension trait for numeric values to create durations
 pub trait DurationExt {
@@ -255,7 +338,7 @@ mod tests {
     #[test]
     fn test_matches_time_unit_day_of_week() {
         // Monday
-        let unit = TimeUnit::DayOfWeek(1);
+        let unit = TimeUnit::DayOfWeek(1.into());
 
         // Monday 2023-01-02
         let dt1 = Utc.with_ymd_and_hms(2023, 1, 2, 12, 0, 0).unwrap();
@@ -281,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_matches_time_unit_month() {
-        let unit = TimeUnit::Month(3); // March
+        let unit = TimeUnit::Month(Month::March); // March
 
         // March 2023
         let dt1 = Utc.with_ymd_and_hms(2023, 3, 15, 12, 0, 0).unwrap();
@@ -335,8 +418,8 @@ mod tests {
     #[test]
     fn test_predicate_any() {
         let pred = Predicate::Any(vec![
-            TimeUnit::DayOfWeek(1), // Monday
-            TimeUnit::DayOfWeek(3), // Wednesday
+            TimeUnit::DayOfWeek(DayOfWeek::Monday),    // Monday
+            TimeUnit::DayOfWeek(DayOfWeek::Wednesday), // Wednesday
         ]);
 
         // Monday
@@ -355,8 +438,8 @@ mod tests {
     #[test]
     fn test_predicate_all() {
         let pred = Predicate::All(vec![
-            TimeUnit::DayOfWeek(1),  // Monday
-            TimeUnit::DayOfMonth(2), // 2nd of month
+            TimeUnit::DayOfWeek(DayOfWeek::Monday), // Monday
+            TimeUnit::DayOfMonth(2),                // 2nd of month
         ]);
 
         // Monday, January 2nd, 2023

@@ -140,7 +140,7 @@ impl<'a> CalendarScheduleBuilder<'a> {
         }
 
         self.predicates
-            .push(Predicate::Exact(TimeUnit::Month(month)));
+            .push(Predicate::Exact(TimeUnit::Month(month.into())));
         Ok(self)
     }
 
@@ -257,7 +257,6 @@ impl<'a> CalendarScheduleBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TimeSource;
 
     #[test]
     fn test_at_method() {
