@@ -17,8 +17,19 @@ jobs:
           fetch-depth: 0
           ref: main
           persist-credentials: false
+      - name: Setup Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - name: Cache cargo-edit
+        uses: actions/cache@v3
+        id: cache-cargo-edit
+        with:
+          path: ~/.cargo/bin/cargo-edit
+          key: ${{ runner.os }}-cargo-edit-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Install cargo-edit
+        if: steps.cache-cargo-edit.outputs.cache-hit != 'true'
         run: cargo install cargo-edit
 
       - name: Upgrade dependencies (pin minor versions)
