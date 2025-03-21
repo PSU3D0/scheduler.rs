@@ -20,6 +20,7 @@ num_cpus = "^1.16"
 rand = "0.8"
 rand_chacha = { version = "0.3", optional = true }
 arc-swap = "^1.7.1"
+chrono = { version = "^0.4", features = ["serde"] }
 
 [features]
 default = []

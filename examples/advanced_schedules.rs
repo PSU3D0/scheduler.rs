@@ -1,4 +1,4 @@
-use schedules::{CallbackHandler, Scheduler, SchedulerConfig, TickEvent};
+use schedules::{CallbackHandler, ExecutionMode, Scheduler, SchedulerConfig, TickEvent};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -36,6 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         store_capacity: 10,
         time_source: None,
         rng_seed: Some(12345), // Fixed seed for deterministic jitter
+        timezone: None,
+        execution_mode: ExecutionMode::Automatic,
     };
 
     let mut scheduler = Scheduler::with_config(config);

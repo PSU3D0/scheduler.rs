@@ -1,5 +1,5 @@
 use rand::Rng;
-use schedules::{Scheduler, SchedulerConfig, TickEvent, callback_fn};
+use schedules::{ExecutionMode, Scheduler, SchedulerConfig, TickEvent, callback_fn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -14,6 +14,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         store_capacity: 5000, // Increased capacity for many schedules
         time_source: None,
         rng_seed: None,
+        timezone: None,
+        execution_mode: ExecutionMode::Automatic,
     };
 
     let mut scheduler = Scheduler::with_config(config);

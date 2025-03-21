@@ -14,9 +14,19 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::FixedOffset;
 use serde::{Deserialize, Serialize};
 use threadpool::ThreadPool;
 use uuid::Uuid;
+
+mod calendar;
+mod execution_mode;
+
+pub use calendar::{
+    DurationExt, FRIDAY, MONDAY, Predicate, PredicateCombination, SATURDAY, SUNDAY, THURSDAY,
+    TUESDAY, TimeUnit, WEDNESDAY, parse_time,
+};
+pub use execution_mode::ExecutionMode;
 
 /// Error type for scheduler operations
 #[derive(Debug)]
@@ -243,6 +253,10 @@ pub struct SchedulerConfig {
     pub time_source: Option<Box<dyn TimeSource>>,
     /// RNG seed for deterministic jitter (if None, uses system random)
     pub rng_seed: Option<u64>,
+    /// Timezone for calendar-based schedules (if None, uses UTC)
+    pub timezone: Option<FixedOffset>,
+    /// Execution mode (automatic or manual)
+    pub execution_mode: ExecutionMode,
 }
 
 impl Clone for SchedulerConfig {
@@ -252,6 +266,8 @@ impl Clone for SchedulerConfig {
             store_capacity: self.store_capacity,
             time_source: None, // We don't clone time sources
             rng_seed: self.rng_seed,
+            timezone: self.timezone,
+            execution_mode: self.execution_mode,
         }
     }
 }
@@ -263,6 +279,8 @@ impl std::fmt::Debug for SchedulerConfig {
             .field("store_capacity", &self.store_capacity)
             .field("time_source", &"<TimeSource>")
             .field("rng_seed", &self.rng_seed)
+            .field("timezone", &self.timezone)
+            .field("execution_mode", &self.execution_mode)
             .finish()
     }
 }
@@ -274,6 +292,8 @@ impl Default for SchedulerConfig {
             store_capacity: 64, // Default capacity for collections
             time_source: None,
             rng_seed: None,
+            timezone: None,
+            execution_mode: ExecutionMode::default(),
         }
     }
 }
@@ -304,6 +324,8 @@ pub struct Scheduler {
     rng: Arc<Mutex<Option<ChaCha8Rng>>>,
     #[cfg(not(feature = "crypto_rand"))]
     rng: Arc<Mutex<Option<StdRng>>>,
+    timezone: Option<FixedOffset>,
+    execution_mode: ExecutionMode,
 }
 
 /// Defines the type of scheduling pattern to use
@@ -311,19 +333,34 @@ pub struct Scheduler {
 pub enum ScheduleType {
     /// Fixed interval schedule
     Fixed(Duration),
+
     /// Jittered schedule (base interval + random jitter)
     Jitter { base: Duration, jitter: Duration },
+
     /// Exponential backoff (increases duration after each execution)
     Exponential {
         initial: Duration,
         factor: f64,
         max: Option<Duration>,
     },
+
     /// Decaying schedule (gradually changing interval)
     Decay {
         initial: Duration,
         target: Duration,
         half_life: Duration,
+    },
+
+    /// Calendar-based schedule with time predicates
+    Calendar {
+        /// Collection of time predicates to match
+        predicates: Vec<Predicate>,
+
+        /// How to combine multiple predicates (All = AND, Any = OR)
+        combine: PredicateCombination,
+
+        /// Pre-calculated next execution time (in UTC timestamp ms)
+        next_time: Option<u64>,
     },
 }
 
@@ -335,6 +372,8 @@ impl ScheduleType {
             ScheduleType::Jitter { base, .. } => *base,
             ScheduleType::Exponential { initial, .. } => *initial,
             ScheduleType::Decay { initial, .. } => *initial,
+            // For calendar-based schedules, use a default tick interval
+            ScheduleType::Calendar { .. } => Duration::from_secs(1),
         }
     }
 }
@@ -390,6 +429,11 @@ enum SerializedScheduleType {
         initial_ms: u64,
         target_ms: u64,
         half_life_ms: u64,
+    },
+    Calendar {
+        predicates: Vec<Predicate>,
+        combine: PredicateCombination,
+        next_time: Option<u64>,
     },
 }
 
@@ -493,7 +537,22 @@ impl Scheduler {
             last_tick: Arc::new(AtomicU64::new(0)),
             thread_pool: Arc::new(ThreadPool::new(config.thread_count)),
             rng: Arc::new(Mutex::new(rng)),
+            timezone: config.timezone,
+            execution_mode: config.execution_mode,
         }
+    }
+
+    /// Create a new scheduler with manual execution mode.
+    pub fn new_manual() -> Self {
+        let config = SchedulerConfig {
+            thread_count: 1,
+            store_capacity: 1000,
+            time_source: None,
+            rng_seed: None,
+            timezone: None,
+            execution_mode: ExecutionMode::Manual,
+        };
+        Self::with_config(config)
     }
 
     /// Add a schedule using a schedule definition
@@ -580,6 +639,22 @@ impl Scheduler {
                     now + current_interval as u64
                 }
             }
+            ScheduleType::Calendar {
+                predicates,
+                combine,
+                next_time,
+            } => {
+                // For calendar-based schedules, calculate the next time that matches our predicates
+                if let Some(nt) = next_time {
+                    if *nt > now {
+                        // If we already have a future execution time, use it
+                        return *nt;
+                    }
+                }
+
+                // Calculate the next time that satisfies our calendar predicates
+                calendar::calculate_next_calendar_time(predicates, combine, now, &self.timezone)
+            }
         }
     }
 
@@ -606,6 +681,23 @@ impl Scheduler {
     /// Start a schedule definition with the specified interval.
     pub fn every<T: Into<Duration>>(&mut self, duration: T) -> ScheduleBuilder {
         ScheduleBuilder::new(self, duration.into())
+    }
+
+    /// Create a calendar-based schedule at a specific time
+    pub fn at(
+        &mut self,
+        time_str: &str,
+    ) -> Result<calendar::CalendarScheduleBuilder, SchedulerError> {
+        let mut builder = calendar::CalendarScheduleBuilder::new(self, format!("at_{}", time_str));
+        builder.at(time_str)?;
+        Ok(builder)
+    }
+
+    /// Create a calendar-based schedule on specific days of the week
+    pub fn on(&mut self, day: TimeUnit) -> calendar::CalendarScheduleBuilder {
+        let mut builder = calendar::CalendarScheduleBuilder::new(self, format!("on_{:?}", day));
+        builder.on_days(&[day]);
+        builder
     }
 
     /// Schedule a pre-defined schedule
@@ -637,6 +729,11 @@ impl Scheduler {
 
     /// Start the scheduler.
     pub fn start(&self) {
+        // In manual mode, don't start the background thread
+        if matches!(self.execution_mode, ExecutionMode::Manual) {
+            return;
+        }
+
         self.running.store(true, Ordering::Release);
 
         // Create clones of all the Arc references for the thread
@@ -707,6 +804,24 @@ impl Scheduler {
 
                             now + current_interval as u64
                         }
+                    }
+                    ScheduleType::Calendar {
+                        predicates,
+                        combine,
+                        next_time,
+                    } => {
+                        // For calendar-based schedules, calculate the next time that matches our predicates
+                        if let Some(nt) = next_time {
+                            if *nt > now {
+                                // If we already have a future execution time, use it
+                                return *nt;
+                            }
+                        }
+
+                        // Calculate the next time that satisfies our calendar predicates
+                        crate::calendar::calculate_next_calendar_time(
+                            predicates, combine, now, &None,
+                        )
                     }
                 }
             }) as Box<dyn Fn(&Schedule, u64) -> u64 + Send + Sync>
@@ -915,6 +1030,263 @@ impl Scheduler {
         self.running.store(false, Ordering::Release);
     }
 
+    /// Process all due schedules (for manual execution mode).
+    /// Returns the number of processed schedules if successful.
+    pub fn run_pending(&self) -> Result<usize, SchedulerError> {
+        // Check execution mode
+        if matches!(self.execution_mode, ExecutionMode::Automatic) && self.is_running() {
+            return Err(SchedulerError::Other(
+                "Cannot run_pending() on a running automatic scheduler. Use stop() first."
+                    .to_string(),
+            ));
+        }
+
+        // Get current time, handling errors
+        let now = match self.time_source.now() {
+            Ok(time) => time,
+            Err(e) => {
+                return Err(SchedulerError::TimeError(format!(
+                    "Error getting time: {}",
+                    e
+                )));
+            }
+        };
+
+        // Record last tick time
+        self.last_tick.store(now, Ordering::Release);
+
+        // Create limits checking function
+        let limits_func = |schedule: &Schedule, now: u64| -> bool {
+            // Check max executions
+            if let Some(max_exec) = schedule.limits.max_executions {
+                if schedule.execution_count >= max_exec {
+                    return true;
+                }
+            }
+
+            // Check max runtime
+            if let Some(max_runtime) = schedule.limits.max_runtime {
+                let elapsed_since_creation = now.saturating_sub(schedule.created_at);
+                if elapsed_since_creation >= max_runtime.as_millis() as u64 {
+                    return true;
+                }
+            }
+
+            false
+        };
+
+        // Create calculate next execution function with access to RNG
+        let calculate_func = {
+            let rng_arc = Arc::clone(&self.rng);
+            move |schedule: &Schedule, now: u64| -> u64 {
+                match &schedule.schedule_type {
+                    ScheduleType::Fixed(interval) => now + interval.as_millis() as u64,
+                    ScheduleType::Jitter { base, jitter } => {
+                        let jitter_ms = if let Ok(mut rng_guard) = rng_arc.lock() {
+                            if let Some(rng) = rng_guard.as_mut() {
+                                // Use deterministic RNG if configured
+                                rng.gen_range(0..jitter.as_millis() as u64)
+                            } else {
+                                // Use thread-local random if no seed provided
+                                thread_rng().gen_range(0..jitter.as_millis() as u64)
+                            }
+                        } else {
+                            // Fallback if lock fails
+                            thread_rng().gen_range(0..jitter.as_millis() as u64)
+                        };
+
+                        now + base.as_millis() as u64 + jitter_ms
+                    }
+                    ScheduleType::Exponential {
+                        initial,
+                        factor,
+                        max,
+                    } => {
+                        let exec_count = schedule.execution_count as f64;
+                        let interval = initial.as_millis() as f64 * factor.powf(exec_count);
+
+                        // Respect the maximum if provided
+                        if let Some(max_interval) = max {
+                            let capped_interval =
+                                (interval as u64).min(max_interval.as_millis() as u64);
+                            now + capped_interval
+                        } else {
+                            now + interval as u64
+                        }
+                    }
+                    ScheduleType::Decay {
+                        initial,
+                        target,
+                        half_life,
+                    } => {
+                        let elapsed = now.saturating_sub(schedule.created_at);
+                        let half_life_ms = half_life.as_millis() as f64;
+
+                        if half_life_ms == 0.0 {
+                            now + target.as_millis() as u64
+                        } else {
+                            let initial_ms = initial.as_millis() as f64;
+                            let target_ms = target.as_millis() as f64;
+
+                            // Exponential decay formula: initial + (target - initial) * (1 - e^(-elapsed/half_life))
+                            let decay_factor = 1.0 - (-(elapsed as f64) / half_life_ms).exp();
+                            let current_interval =
+                                initial_ms + (target_ms - initial_ms) * decay_factor;
+
+                            now + current_interval as u64
+                        }
+                    }
+                    ScheduleType::Calendar {
+                        predicates,
+                        combine,
+                        next_time,
+                    } => {
+                        // For calendar-based schedules, we already have a pre-calculated next time.
+                        // If not set or has been reached, calculate the next time from now
+                        if next_time.is_none() || next_time.unwrap() <= now {
+                            crate::calendar::calculate_next_calendar_time(
+                                predicates,
+                                combine,
+                                now,
+                                &self.timezone,
+                            )
+                        } else {
+                            next_time.unwrap()
+                        }
+                    }
+                }
+            }
+        };
+
+        let mut due_schedules = Vec::with_capacity(16); // Preallocate
+
+        // Collect schedules that are due
+        for schedule in self.schedules.get_all() {
+            // Skip schedules that have reached their limits
+            if limits_func(&schedule, now) {
+                continue;
+            }
+
+            if let Some(next_execution) = schedule.next_execution {
+                if next_execution <= now {
+                    // Calculate the next execution time based on the schedule type
+                    let next_time = calculate_func(&schedule, now);
+
+                    // Mark the schedule for execution with updated execution count
+                    let updated_schedule = Schedule {
+                        id: schedule.id.clone(),
+                        name: schedule.name.clone(),
+                        schedule_type: schedule.schedule_type.clone(),
+                        next_execution: Some(next_time),
+                        callback_id: schedule.callback_id.clone(),
+                        event_buses: schedule.event_buses.clone(),
+                        execution_count: schedule.execution_count + 1,
+                        created_at: schedule.created_at,
+                        limits: schedule.limits.clone(),
+                    };
+
+                    self.schedules
+                        .insert(schedule.id.clone(), updated_schedule.clone());
+                    due_schedules.push((schedule.id.clone(), updated_schedule));
+                }
+            } else {
+                // First-time execution - calculate initial next execution time
+                let next_time = calculate_func(&schedule, now);
+
+                let updated_schedule = Schedule {
+                    id: schedule.id.clone(),
+                    name: schedule.name.clone(),
+                    schedule_type: schedule.schedule_type.clone(),
+                    next_execution: Some(next_time),
+                    callback_id: schedule.callback_id.clone(),
+                    event_buses: schedule.event_buses.clone(),
+                    execution_count: 0, // First execution happens on next tick
+                    created_at: schedule.created_at,
+                    limits: schedule.limits.clone(),
+                };
+
+                self.schedules.insert(schedule.id.clone(), updated_schedule);
+            }
+        }
+
+        // Process due schedules
+        for (id, schedule) in due_schedules.iter() {
+            let metadata = HashMap::with_capacity(4); // Preallocate with expected size
+            let event = TickEvent {
+                id: id.clone(),
+                schedule_name: schedule.name.clone(),
+                timestamp: now,
+                metadata,
+            };
+
+            // Execute callback if configured
+            if let Some(callback_id) = &schedule.callback_id {
+                // Clone the Arc reference to the callback registry
+                let callback_registry_clone = Arc::clone(&self.callback_registry);
+                let callback_id = callback_id.clone();
+                let event_clone = event.clone();
+
+                // Execute the callback in the thread pool
+                self.thread_pool.execute(move || {
+                    // Access the handler from the registry, handling lock errors
+                    match callback_registry_clone.lock() {
+                        Ok(registry) => {
+                            if let Some(handler) = registry.get(&callback_id) {
+                                // Catch and log panics in handlers to prevent thread pool depletion
+                                let result =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        handler.handle(event_clone);
+                                    }));
+
+                                if let Err(panic) = result {
+                                    eprintln!(
+                                        "Handler panicked for schedule '{}': {:?}",
+                                        callback_id, panic
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error acquiring callback registry lock: {}", e);
+                        }
+                    }
+                });
+            }
+
+            // Emit to configured event buses
+            for bus_id in &schedule.event_buses {
+                let event_clone = event.clone();
+                let event_buses_clone = Arc::clone(&self.event_buses);
+                let bus_id_clone = bus_id.clone();
+
+                // Execute the event bus emission in the thread pool
+                self.thread_pool.execute(move || {
+                    // Access the event bus, handling lock errors
+                    match event_buses_clone.lock() {
+                        Ok(buses) => {
+                            if let Some(bus) = buses.get(&bus_id_clone) {
+                                // Catch and log panics in event buses
+                                let result =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        bus.emit(event_clone);
+                                    }));
+
+                                if let Err(panic) = result {
+                                    eprintln!("Event bus '{}' panicked: {:?}", bus_id_clone, panic);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error acquiring event buses lock: {}", e);
+                        }
+                    }
+                });
+            }
+        }
+
+        Ok(due_schedules.len())
+    }
+
     /// Check if the scheduler is currently running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
@@ -973,6 +1345,15 @@ impl Scheduler {
                         initial_ms: initial.as_millis() as u64,
                         target_ms: target.as_millis() as u64,
                         half_life_ms: half_life.as_millis() as u64,
+                    },
+                    ScheduleType::Calendar {
+                        predicates,
+                        combine,
+                        next_time,
+                    } => SerializedScheduleType::Calendar {
+                        predicates: predicates.clone(),
+                        combine: combine.clone(),
+                        next_time,
                     },
                 };
 
@@ -1034,6 +1415,15 @@ impl Scheduler {
                     initial: Duration::from_millis(initial_ms),
                     target: Duration::from_millis(target_ms),
                     half_life: Duration::from_millis(half_life_ms),
+                },
+                SerializedScheduleType::Calendar {
+                    predicates,
+                    combine,
+                    next_time,
+                } => ScheduleType::Calendar {
+                    predicates,
+                    combine,
+                    next_time,
                 },
             };
 
@@ -1241,6 +1631,10 @@ impl ScheduleDefinition {
                 let add = additional.into();
                 *initial += add;
                 *target += add;
+            }
+            ScheduleType::Calendar { .. } => {
+                // For calendar-based schedules, we don't support adding duration
+                // as they operate on specific times, not intervals
             }
         }
         self
@@ -1487,6 +1881,19 @@ pub mod async_support {
             self.scheduler.every(duration)
         }
 
+        /// Create a calendar-based schedule at a specific time
+        pub fn at(
+            &mut self,
+            time_str: &str,
+        ) -> Result<calendar::CalendarScheduleBuilder, SchedulerError> {
+            self.scheduler.at(time_str)
+        }
+
+        /// Create a calendar-based schedule on specific days of the week
+        pub fn on(&mut self, day: TimeUnit) -> calendar::CalendarScheduleBuilder {
+            self.scheduler.on(day)
+        }
+
         /// Schedule a pre-defined schedule
         pub fn schedule(&self, definition: ScheduleDefinition) -> Result<String, SchedulerError> {
             self.scheduler.schedule(definition)
@@ -1500,6 +1907,18 @@ pub mod async_support {
         /// Stop the async scheduler.
         pub fn stop(&self) {
             self.scheduler.stop();
+        }
+
+        /// Create a new scheduler with manual execution mode.
+        pub fn new_manual() -> Self {
+            AsyncScheduler {
+                scheduler: Scheduler::new_manual(),
+            }
+        }
+
+        /// Process all due schedules in manual mode.
+        pub fn run_pending(&self) -> Result<usize, SchedulerError> {
+            self.scheduler.run_pending()
         }
 
         /// Check if the scheduler is currently running.
@@ -1620,6 +2039,8 @@ mod tests {
                 store_capacity: 10,
                 time_source: None,
                 rng_seed: Some(12345),
+                timezone: None,
+                execution_mode: ExecutionMode::Automatic,
             };
 
             let mut scheduler = Scheduler::with_config(config);
@@ -1943,13 +2364,14 @@ mod tests {
         let mut jitter_count = 0;
         let mut exponential_count = 0;
         let mut decay_count = 0;
-
+        let mut calendar_count = 0;
         for schedule in schedules {
             match schedule.schedule_type {
                 ScheduleType::Fixed(_) => fixed_count += 1,
                 ScheduleType::Jitter { .. } => jitter_count += 1,
                 ScheduleType::Exponential { .. } => exponential_count += 1,
                 ScheduleType::Decay { .. } => decay_count += 1,
+                ScheduleType::Calendar { .. } => calendar_count += 1,
             }
         }
 
@@ -1957,6 +2379,7 @@ mod tests {
         assert_eq!(jitter_count, 1);
         assert_eq!(exponential_count, 1);
         assert_eq!(decay_count, 1);
+        assert_eq!(calendar_count, 0);
     }
 
     #[test]
@@ -2094,6 +2517,8 @@ mod tests {
             store_capacity: 32,
             time_source: None,
             rng_seed: None,
+            timezone: None,
+            execution_mode: ExecutionMode::Automatic,
         };
 
         let mut scheduler = Scheduler::with_config(config);
