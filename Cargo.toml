@@ -1,5 +1,5 @@
 [package]
-name = "schedule_rs"
+name = "schedules"
 version = "0.1.0"
 edition = "2024"
 description = "A lightweight Rust library for managing operations across multiple time scales"

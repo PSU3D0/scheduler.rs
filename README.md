@@ -1,7 +1,7 @@
-# ⏰ schedule.rs 🚀
+# ⏰ schedules.rs 🚀
 
 <p align="center">
-  <img src="assets/banner.jpg" alt="Schedule.rs Banner" width="800"/>
+  <img src="assets/banner.jpg" alt="Schedules.rs Banner" width="800"/>
 </p>
 
 ## ✨ A lightweight Rust library for scheduling operations across multiple time scales! ✨
