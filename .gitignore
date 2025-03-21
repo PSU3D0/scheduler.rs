@@ -1,0 +1,16 @@
+/target/
+Cargo.lock
+
+# Remove macOS specific files
+.DS_Store
+
+# Remove editor specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Remove any local environment files
+.env
+
+scheduler_state.json
