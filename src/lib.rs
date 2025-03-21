@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use rand::prelude::*;
 #[cfg(not(feature = "crypto_rand"))]
 use rand::rngs::StdRng;
@@ -8,7 +9,7 @@ use std::error::Error;
 use std::fmt::{self, Display};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -53,130 +54,84 @@ impl<T> From<PoisonError<T>> for SchedulerError {
 // ----------------- SECTION 1: Core Types -----------------
 
 /// A lock-free store for schedule data
+#[derive(Default)]
 pub struct LockFreeScheduleStore {
-    ptr: AtomicPtr<HashMap<String, Schedule>>,
-}
-
-impl Default for LockFreeScheduleStore {
-    fn default() -> Self {
-        Self::new()
-    }
+    store: ArcSwap<HashMap<String, Schedule>>,
 }
 
 impl LockFreeScheduleStore {
     /// Creates a new empty schedule store.
     pub fn new() -> Self {
-        let map = Box::new(HashMap::new());
         Self {
-            ptr: AtomicPtr::new(Box::into_raw(map)),
+            store: ArcSwap::new(Arc::new(HashMap::new())),
         }
     }
 
     /// Creates a new schedule store with the given initial capacity.
     pub fn with_capacity(capacity: usize) -> Self {
-        let map = Box::new(HashMap::with_capacity(capacity));
         Self {
-            ptr: AtomicPtr::new(Box::into_raw(map)),
+            store: ArcSwap::new(Arc::new(HashMap::with_capacity(capacity))),
         }
     }
 
     /// Gets a schedule by its ID, if it exists.
     pub fn get(&self, id: &str) -> Option<Schedule> {
-        // Get a consistent view of the current map
-        let ptr = self.ptr.load(Ordering::Acquire);
-        let map = unsafe { &*ptr };
-        map.get(id).cloned()
+        self.store.load().get(id).cloned()
     }
 
     /// Gets all schedules in the store.
     pub fn get_all(&self) -> Vec<Schedule> {
-        let ptr = self.ptr.load(Ordering::Acquire);
-        let map = unsafe { &*ptr };
-        map.values().cloned().collect()
+        self.store.load().values().cloned().collect()
     }
 
     /// Inserts a schedule into the store.
     pub fn insert(&self, id: String, schedule: Schedule) {
-        // Create a new map with the updated data
-        let current_ptr = self.ptr.load(Ordering::Acquire);
-        let current_map = unsafe { &*current_ptr };
-
-        // Create new map with inserted value
-        let mut new_map = current_map.clone();
-        new_map.insert(id, schedule);
-        let new_ptr = Box::into_raw(Box::new(new_map));
-
-        // Try to swap in the new map
-        match self
-            .ptr
-            .compare_exchange(current_ptr, new_ptr, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => {
-                // Success - free the old map
-                unsafe {
-                    drop(Box::from_raw(current_ptr));
-                }
+        loop {
+            // Load the current schedule map.
+            let current = self.store.load();
+            // Clone the current map, update it.
+            let mut new_map = (**current).clone();
+            new_map.insert(id.clone(), schedule.clone());
+            let new_arc = Arc::new(new_map);
+            // Try to swap in the new map.
+            if Arc::<HashMap<std::string::String, Schedule>>::ptr_eq(
+                &self.store.compare_and_swap(&current, new_arc),
+                &current,
+            ) {
+                break;
             }
-            Err(_) => {
-                // Another thread updated the map, discard our update
-                unsafe {
-                    drop(Box::from_raw(new_ptr));
-                }
-            }
+            // If the swap fails, another thread updated the map;
+            // we loop and try again.
         }
     }
 
     /// Removes a schedule from the store, returning the removed schedule if it existed.
     pub fn remove(&self, id: &str) -> Option<Schedule> {
-        // Get current map
-        let current_ptr = self.ptr.load(Ordering::Acquire);
-        let current_map = unsafe { &*current_ptr };
-
-        // Check if the key exists
-        if !current_map.contains_key(id) {
-            return None;
-        }
-
-        // Create new map without the removed schedule
-        let mut new_map = current_map.clone();
-        let removed = new_map.remove(id);
-        let new_ptr = Box::into_raw(Box::new(new_map));
-
-        // Try to swap in the new map
-        match self
-            .ptr
-            .compare_exchange(current_ptr, new_ptr, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => {
-                // Success - free the old map
-                unsafe {
-                    drop(Box::from_raw(current_ptr));
-                }
-                removed
+        loop {
+            let current = self.store.load();
+            if !current.contains_key(id) {
+                return None;
             }
-            Err(_) => {
-                // Another thread updated the map, discard our update
-                unsafe {
-                    drop(Box::from_raw(new_ptr));
-                }
-                // Try again (could be optimized with a retry limit)
-                self.remove(id)
+            let mut new_map = (**current).clone();
+            let removed = new_map.remove(id);
+            let new_arc = Arc::new(new_map);
+            if Arc::<HashMap<std::string::String, Schedule>>::ptr_eq(
+                &self.store.compare_and_swap(&current, new_arc),
+                &current,
+            ) {
+                return removed;
             }
         }
     }
 
     /// Checks if the store contains a schedule with the given ID.
     pub fn contains_key(&self, id: &str) -> bool {
-        let ptr = self.ptr.load(Ordering::Acquire);
-        let map = unsafe { &*ptr };
-        map.contains_key(id)
+        self.store.load().contains_key(id)
     }
 
     /// Returns the number of schedules in the store.
     pub fn len(&self) -> usize {
-        let ptr = self.ptr.load(Ordering::Acquire);
-        let map = unsafe { &*ptr };
-        map.len()
+        self.store.load().len()
     }
 
     /// Returns true if the store contains no schedules.
@@ -186,38 +141,15 @@ impl LockFreeScheduleStore {
 
     /// Removes all schedules from the store.
     pub fn clear(&self) {
-        let current_ptr = self.ptr.load(Ordering::Acquire);
-        let new_map = Box::new(HashMap::new());
-        let new_ptr = Box::into_raw(new_map);
-
-        // Try to swap in the empty map
-        match self
-            .ptr
-            .compare_exchange(current_ptr, new_ptr, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => {
-                // Success - free the old map
-                unsafe {
-                    drop(Box::from_raw(current_ptr));
-                }
+        loop {
+            let current = self.store.load();
+            let new_arc = Arc::new(HashMap::new());
+            if Arc::<HashMap<std::string::String, Schedule>>::ptr_eq(
+                &self.store.compare_and_swap(&current, new_arc),
+                &current,
+            ) {
+                break;
             }
-            Err(_) => {
-                // Another thread updated the map, discard our update
-                unsafe {
-                    drop(Box::from_raw(new_ptr));
-                }
-                // Try again
-                self.clear();
-            }
-        }
-    }
-}
-
-impl Drop for LockFreeScheduleStore {
-    fn drop(&mut self) {
-        let ptr = self.ptr.load(Ordering::Acquire);
-        unsafe {
-            drop(Box::from_raw(ptr));
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "schedules"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A lightweight Rust library for managing operations across multiple time scales"
 license = "MIT"
@@ -19,6 +19,7 @@ threadpool = "^1.8"
 num_cpus = "^1.16"
 rand = "0.8"
 rand_chacha = { version = "0.3", optional = true }
+arc-swap = "^1.7.1"
 
 [features]
 default = []
