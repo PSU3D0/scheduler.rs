@@ -15,8 +15,8 @@ serde = { version = "^1.0", features = ["derive"] }
 serde_json = "^1.0"
 uuid = { version = "^1.0", features = ["v4"] }
 tokio = { version = "^1.0", features = ["rt", "rt-multi-thread", "time", "macros", "signal"], optional = true }
-threadpool = "1.8"
-num_cpus = "1.16"
+threadpool = "^1.8"
+num_cpus = "^1.16"
 rand = "0.8"
 rand_chacha = { version = "0.3", optional = true }
 
