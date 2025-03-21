@@ -1,3 +1,5 @@
+use rand::prelude::*;
+use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -304,6 +306,8 @@ pub struct SchedulerConfig {
     pub store_capacity: usize,
     /// Custom time source, if not specified a default will be used
     pub time_source: Option<Box<dyn TimeSource>>,
+    /// RNG seed for deterministic jitter (if None, uses system random)
+    pub rng_seed: Option<u64>,
 }
 
 impl Clone for SchedulerConfig {
@@ -312,6 +316,7 @@ impl Clone for SchedulerConfig {
             thread_count: self.thread_count,
             store_capacity: self.store_capacity,
             time_source: None, // We don't clone time sources
+            rng_seed: self.rng_seed,
         }
     }
 }
@@ -322,6 +327,7 @@ impl std::fmt::Debug for SchedulerConfig {
             .field("thread_count", &self.thread_count)
             .field("store_capacity", &self.store_capacity)
             .field("time_source", &"<TimeSource>")
+            .field("rng_seed", &self.rng_seed)
             .finish()
     }
 }
@@ -332,8 +338,22 @@ impl Default for SchedulerConfig {
             thread_count: std::cmp::max(4, num_cpus::get()),
             store_capacity: 64, // Default capacity for collections
             time_source: None,
+            rng_seed: None,
         }
     }
+}
+
+/// Wrapper for scheduler functions that need to be accessible in the worker thread
+/// Type for calculating the next execution time of a schedule
+type NextExecutionCalculator = Box<dyn Fn(&Schedule, u64) -> u64 + Send + Sync>;
+
+/// Type for checking if a schedule has reached its execution limits
+type LimitsChecker = Box<dyn Fn(&Schedule, u64) -> bool + Send + Sync>;
+
+/// Wrapper for scheduler functions that need to be accessible in the worker thread
+struct SchedulerFunctions {
+    calculate_next_execution: NextExecutionCalculator,
+    has_reached_limits: LimitsChecker,
 }
 
 /// A scheduler for managing operations across multiple time scales.
@@ -345,6 +365,49 @@ pub struct Scheduler {
     running: Arc<AtomicBool>,
     last_tick: Arc<AtomicU64>,
     thread_pool: Arc<ThreadPool>,
+    rng: Arc<Mutex<Option<ChaCha8Rng>>>,
+}
+
+/// Defines the type of scheduling pattern to use
+#[derive(Clone, Debug)]
+pub enum ScheduleType {
+    /// Fixed interval schedule
+    Fixed(Duration),
+    /// Jittered schedule (base interval + random jitter)
+    Jitter { base: Duration, jitter: Duration },
+    /// Exponential backoff (increases duration after each execution)
+    Exponential {
+        initial: Duration,
+        factor: f64,
+        max: Option<Duration>,
+    },
+    /// Decaying schedule (gradually changing interval)
+    Decay {
+        initial: Duration,
+        target: Duration,
+        half_life: Duration,
+    },
+}
+
+impl ScheduleType {
+    /// Gets the base interval for this schedule type
+    pub fn base_interval(&self) -> Duration {
+        match self {
+            ScheduleType::Fixed(interval) => *interval,
+            ScheduleType::Jitter { base, .. } => *base,
+            ScheduleType::Exponential { initial, .. } => *initial,
+            ScheduleType::Decay { initial, .. } => *initial,
+        }
+    }
+}
+
+/// Limits for schedule execution
+#[derive(Clone, Debug, Default)]
+pub struct ScheduleLimits {
+    /// Maximum number of executions (None = unlimited)
+    pub max_executions: Option<u64>,
+    /// Maximum total runtime for this schedule (None = unlimited)
+    pub max_runtime: Option<Duration>,
 }
 
 /// An individual schedule definition with timing and callback information.
@@ -352,10 +415,13 @@ pub struct Scheduler {
 pub struct Schedule {
     id: String,
     name: String,
-    interval: Duration,
+    schedule_type: ScheduleType,
     next_execution: Option<u64>,
     callback_id: Option<String>,
     event_buses: Vec<String>,
+    execution_count: u64,
+    created_at: u64,
+    limits: ScheduleLimits,
 }
 
 /// Event structure for schedule ticks.
@@ -367,15 +433,47 @@ pub struct TickEvent {
     pub metadata: HashMap<String, String>,
 }
 
+/// Serializable representation of a schedule type
+#[derive(Serialize, Deserialize)]
+enum SerializedScheduleType {
+    Fixed {
+        interval_ms: u64,
+    },
+    Jitter {
+        base_ms: u64,
+        jitter_ms: u64,
+    },
+    Exponential {
+        initial_ms: u64,
+        factor: f64,
+        max_ms: Option<u64>,
+    },
+    Decay {
+        initial_ms: u64,
+        target_ms: u64,
+        half_life_ms: u64,
+    },
+}
+
+/// Serializable representation of schedule limits
+#[derive(Serialize, Deserialize)]
+struct SerializedLimits {
+    max_executions: Option<u64>,
+    max_runtime_ms: Option<u64>,
+}
+
 /// Serializable representation of a schedule.
 #[derive(Serialize, Deserialize)]
 struct SerializedSchedule {
     id: String,
     name: String,
-    interval_ms: u64,
+    schedule_type: SerializedScheduleType,
     next_execution: Option<u64>,
     callback_id: Option<String>,
     event_buses: Vec<String>,
+    execution_count: u64,
+    created_at: u64,
+    limits: SerializedLimits,
 }
 
 /// Serializable scheduler state for persistence.
@@ -442,6 +540,9 @@ impl Scheduler {
             },
         };
 
+        // Initialize RNG if a seed is provided
+        let rng = config.rng_seed.map(ChaCha8Rng::seed_from_u64);
+
         Scheduler {
             schedules: Arc::new(LockFreeScheduleStore::new()),
             callback_registry: Arc::new(Mutex::new(HashMap::with_capacity(config.store_capacity))),
@@ -450,12 +551,125 @@ impl Scheduler {
             running: Arc::new(AtomicBool::new(false)),
             last_tick: Arc::new(AtomicU64::new(0)),
             thread_pool: Arc::new(ThreadPool::new(config.thread_count)),
+            rng: Arc::new(Mutex::new(rng)),
         }
+    }
+
+    /// Add a schedule using a schedule definition
+    pub fn add_schedule(&self, definition: ScheduleDefinition) -> Result<String, SchedulerError> {
+        let id = Uuid::new_v4().to_string();
+        let name = definition
+            .name
+            .unwrap_or_else(|| format!("schedule_{}", id));
+
+        // Get current time for created_at timestamp
+        let now = self.time_source.now()?;
+
+        let schedule = Schedule {
+            id: id.clone(),
+            name,
+            schedule_type: definition.schedule_type,
+            next_execution: None,
+            callback_id: definition.callback_id,
+            event_buses: definition.event_buses,
+            execution_count: 0,
+            created_at: now,
+            limits: definition.limits,
+        };
+
+        self.schedules.insert(id.clone(), schedule);
+
+        Ok(id)
+    }
+
+    /// Calculate the next execution time based on the schedule type and execution count
+    pub fn calculate_next_execution(&self, schedule: &Schedule, now: u64) -> u64 {
+        match &schedule.schedule_type {
+            ScheduleType::Fixed(interval) => now + interval.as_millis() as u64,
+            ScheduleType::Jitter { base, jitter } => {
+                let jitter_ms = if let Ok(mut rng_guard) = self.rng.lock() {
+                    if let Some(rng) = rng_guard.as_mut() {
+                        // Use deterministic RNG if configured
+                        rng.gen_range(0..jitter.as_millis() as u64)
+                    } else {
+                        // Use thread-local random if no seed provided
+                        thread_rng().gen_range(0..jitter.as_millis() as u64)
+                    }
+                } else {
+                    // Fallback if lock fails
+                    thread_rng().gen_range(0..jitter.as_millis() as u64)
+                };
+
+                now + base.as_millis() as u64 + jitter_ms
+            }
+            ScheduleType::Exponential {
+                initial,
+                factor,
+                max,
+            } => {
+                let exec_count = schedule.execution_count as f64;
+                let interval = initial.as_millis() as f64 * factor.powf(exec_count);
+
+                // Respect the maximum if provided
+                if let Some(max_interval) = max {
+                    let capped_interval = (interval as u64).min(max_interval.as_millis() as u64);
+                    now + capped_interval
+                } else {
+                    now + interval as u64
+                }
+            }
+            ScheduleType::Decay {
+                initial,
+                target,
+                half_life,
+            } => {
+                let elapsed = now.saturating_sub(schedule.created_at);
+                let half_life_ms = half_life.as_millis() as f64;
+
+                if half_life_ms == 0.0 {
+                    now + target.as_millis() as u64
+                } else {
+                    let initial_ms = initial.as_millis() as f64;
+                    let target_ms = target.as_millis() as f64;
+
+                    // Exponential decay formula: initial + (target - initial) * (1 - e^(-elapsed/half_life))
+                    let decay_factor = 1.0 - (-(elapsed as f64) / half_life_ms).exp();
+                    let current_interval = initial_ms + (target_ms - initial_ms) * decay_factor;
+
+                    now + current_interval as u64
+                }
+            }
+        }
+    }
+
+    /// Check if a schedule has reached its execution limits
+    pub fn has_reached_limits(&self, schedule: &Schedule, now: u64) -> bool {
+        // Check max executions
+        if let Some(max_exec) = schedule.limits.max_executions {
+            if schedule.execution_count >= max_exec {
+                return true;
+            }
+        }
+
+        // Check max runtime
+        if let Some(max_runtime) = schedule.limits.max_runtime {
+            let elapsed_since_creation = now.saturating_sub(schedule.created_at);
+            if elapsed_since_creation >= max_runtime.as_millis() as u64 {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Start a schedule definition with the specified interval.
     pub fn every<T: Into<Duration>>(&mut self, duration: T) -> ScheduleBuilder {
         ScheduleBuilder::new(self, duration.into())
+    }
+
+    /// Schedule a pre-defined schedule
+    pub fn schedule(&self, definition: ScheduleDefinition) -> Result<String, SchedulerError> {
+        self.add_schedule(definition)
     }
 
     /// Register a callback handler with the specified ID.
@@ -492,6 +706,96 @@ impl Scheduler {
         let running = Arc::clone(&self.running);
         let last_tick = Arc::clone(&self.last_tick);
         let thread_pool = Arc::clone(&self.thread_pool);
+        // Create copies of methods we need to use in the thread
+        let calculate_func = {
+            let rng_arc = Arc::clone(&self.rng);
+            Box::new(move |schedule: &Schedule, now: u64| -> u64 {
+                match &schedule.schedule_type {
+                    ScheduleType::Fixed(interval) => now + interval.as_millis() as u64,
+                    ScheduleType::Jitter { base, jitter } => {
+                        let jitter_ms = if let Ok(mut rng_guard) = rng_arc.lock() {
+                            if let Some(rng) = rng_guard.as_mut() {
+                                // Use deterministic RNG if configured
+                                rng.gen_range(0..jitter.as_millis() as u64)
+                            } else {
+                                // Use thread-local random if no seed provided
+                                thread_rng().gen_range(0..jitter.as_millis() as u64)
+                            }
+                        } else {
+                            // Fallback if lock fails
+                            thread_rng().gen_range(0..jitter.as_millis() as u64)
+                        };
+
+                        now + base.as_millis() as u64 + jitter_ms
+                    }
+                    ScheduleType::Exponential {
+                        initial,
+                        factor,
+                        max,
+                    } => {
+                        let exec_count = schedule.execution_count as f64;
+                        let interval = initial.as_millis() as f64 * factor.powf(exec_count);
+
+                        // Respect the maximum if provided
+                        if let Some(max_interval) = max {
+                            let capped_interval =
+                                (interval as u64).min(max_interval.as_millis() as u64);
+                            now + capped_interval
+                        } else {
+                            now + interval as u64
+                        }
+                    }
+                    ScheduleType::Decay {
+                        initial,
+                        target,
+                        half_life,
+                    } => {
+                        let elapsed = now.saturating_sub(schedule.created_at);
+                        let half_life_ms = half_life.as_millis() as f64;
+
+                        if half_life_ms == 0.0 {
+                            now + target.as_millis() as u64
+                        } else {
+                            let initial_ms = initial.as_millis() as f64;
+                            let target_ms = target.as_millis() as f64;
+
+                            // Exponential decay formula: initial + (target - initial) * (1 - e^(-elapsed/half_life))
+                            let decay_factor = 1.0 - (-(elapsed as f64) / half_life_ms).exp();
+                            let current_interval =
+                                initial_ms + (target_ms - initial_ms) * decay_factor;
+
+                            now + current_interval as u64
+                        }
+                    }
+                }
+            }) as Box<dyn Fn(&Schedule, u64) -> u64 + Send + Sync>
+        };
+
+        // Create limits checking function
+        let limits_func = Box::new(move |schedule: &Schedule, now: u64| -> bool {
+            // Check max executions
+            if let Some(max_exec) = schedule.limits.max_executions {
+                if schedule.execution_count >= max_exec {
+                    return true;
+                }
+            }
+
+            // Check max runtime
+            if let Some(max_runtime) = schedule.limits.max_runtime {
+                let elapsed_since_creation = now.saturating_sub(schedule.created_at);
+                if elapsed_since_creation >= max_runtime.as_millis() as u64 {
+                    return true;
+                }
+            }
+
+            false
+        }) as Box<dyn Fn(&Schedule, u64) -> bool + Send + Sync>;
+
+        // Create scheduler functions bundle
+        let scheduler_funcs = Arc::new(SchedulerFunctions {
+            calculate_next_execution: calculate_func,
+            has_reached_limits: limits_func,
+        });
 
         thread::spawn(move || {
             while running.load(Ordering::Acquire) {
@@ -512,30 +816,47 @@ impl Scheduler {
 
                 // Collect schedules that are due
                 for schedule in schedules.get_all() {
+                    // Skip schedules that have reached their limits
+                    if (scheduler_funcs.has_reached_limits)(&schedule, now) {
+                        continue;
+                    }
+
                     if let Some(next_execution) = schedule.next_execution {
                         if next_execution <= now {
-                            // Mark the schedule for execution
+                            // Calculate the next execution time based on the schedule type
+                            let next_time =
+                                (scheduler_funcs.calculate_next_execution)(&schedule, now);
+
+                            // Mark the schedule for execution with updated execution count
                             let updated_schedule = Schedule {
                                 id: schedule.id.clone(),
                                 name: schedule.name.clone(),
-                                interval: schedule.interval,
-                                next_execution: Some(now + schedule.interval.as_millis() as u64),
+                                schedule_type: schedule.schedule_type.clone(),
+                                next_execution: Some(next_time),
                                 callback_id: schedule.callback_id.clone(),
                                 event_buses: schedule.event_buses.clone(),
+                                execution_count: schedule.execution_count + 1,
+                                created_at: schedule.created_at,
+                                limits: schedule.limits.clone(),
                             };
 
                             schedules.insert(schedule.id.clone(), updated_schedule.clone());
                             due_schedules.push((schedule.id.clone(), updated_schedule));
                         }
                     } else {
-                        // First-time execution
+                        // First-time execution - calculate initial next execution time
+                        let next_time = (scheduler_funcs.calculate_next_execution)(&schedule, now);
+
                         let updated_schedule = Schedule {
                             id: schedule.id.clone(),
                             name: schedule.name.clone(),
-                            interval: schedule.interval,
-                            next_execution: Some(now + schedule.interval.as_millis() as u64),
+                            schedule_type: schedule.schedule_type.clone(),
+                            next_execution: Some(next_time),
                             callback_id: schedule.callback_id.clone(),
                             event_buses: schedule.event_buses.clone(),
+                            execution_count: 0, // First execution happens on next tick
+                            created_at: schedule.created_at,
+                            limits: schedule.limits.clone(),
                         };
 
                         schedules.insert(schedule.id.clone(), updated_schedule);
@@ -684,13 +1005,53 @@ impl Scheduler {
             .schedules
             .get_all()
             .into_iter()
-            .map(|schedule| SerializedSchedule {
-                id: schedule.id.clone(),
-                name: schedule.name.clone(),
-                interval_ms: schedule.interval.as_millis() as u64,
-                next_execution: schedule.next_execution,
-                callback_id: schedule.callback_id.clone(),
-                event_buses: schedule.event_buses.clone(),
+            .map(|schedule| {
+                // Convert ScheduleType to SerializedScheduleType
+                let schedule_type = match schedule.schedule_type {
+                    ScheduleType::Fixed(interval) => SerializedScheduleType::Fixed {
+                        interval_ms: interval.as_millis() as u64,
+                    },
+                    ScheduleType::Jitter { base, jitter } => SerializedScheduleType::Jitter {
+                        base_ms: base.as_millis() as u64,
+                        jitter_ms: jitter.as_millis() as u64,
+                    },
+                    ScheduleType::Exponential {
+                        initial,
+                        factor,
+                        max,
+                    } => SerializedScheduleType::Exponential {
+                        initial_ms: initial.as_millis() as u64,
+                        factor,
+                        max_ms: max.map(|d| d.as_millis() as u64),
+                    },
+                    ScheduleType::Decay {
+                        initial,
+                        target,
+                        half_life,
+                    } => SerializedScheduleType::Decay {
+                        initial_ms: initial.as_millis() as u64,
+                        target_ms: target.as_millis() as u64,
+                        half_life_ms: half_life.as_millis() as u64,
+                    },
+                };
+
+                // Serialize limits
+                let limits = SerializedLimits {
+                    max_executions: schedule.limits.max_executions,
+                    max_runtime_ms: schedule.limits.max_runtime.map(|d| d.as_millis() as u64),
+                };
+
+                SerializedSchedule {
+                    id: schedule.id.clone(),
+                    name: schedule.name.clone(),
+                    schedule_type,
+                    next_execution: schedule.next_execution,
+                    callback_id: schedule.callback_id.clone(),
+                    event_buses: schedule.event_buses.clone(),
+                    execution_count: schedule.execution_count,
+                    created_at: schedule.created_at,
+                    limits,
+                }
             })
             .collect();
 
@@ -706,13 +1067,51 @@ impl Scheduler {
 
         // Restore schedules
         for serialized in state.schedules {
+            // Convert SerializedScheduleType to ScheduleType
+            let schedule_type = match serialized.schedule_type {
+                SerializedScheduleType::Fixed { interval_ms } => {
+                    ScheduleType::Fixed(Duration::from_millis(interval_ms))
+                }
+                SerializedScheduleType::Jitter { base_ms, jitter_ms } => ScheduleType::Jitter {
+                    base: Duration::from_millis(base_ms),
+                    jitter: Duration::from_millis(jitter_ms),
+                },
+                SerializedScheduleType::Exponential {
+                    initial_ms,
+                    factor,
+                    max_ms,
+                } => ScheduleType::Exponential {
+                    initial: Duration::from_millis(initial_ms),
+                    factor,
+                    max: max_ms.map(Duration::from_millis),
+                },
+                SerializedScheduleType::Decay {
+                    initial_ms,
+                    target_ms,
+                    half_life_ms,
+                } => ScheduleType::Decay {
+                    initial: Duration::from_millis(initial_ms),
+                    target: Duration::from_millis(target_ms),
+                    half_life: Duration::from_millis(half_life_ms),
+                },
+            };
+
+            // Deserialize limits
+            let limits = ScheduleLimits {
+                max_executions: serialized.limits.max_executions,
+                max_runtime: serialized.limits.max_runtime_ms.map(Duration::from_millis),
+            };
+
             let schedule = Schedule {
                 id: serialized.id.clone(),
                 name: serialized.name,
-                interval: Duration::from_millis(serialized.interval_ms),
+                schedule_type,
                 next_execution: serialized.next_execution,
                 callback_id: serialized.callback_id,
                 event_buses: serialized.event_buses,
+                execution_count: serialized.execution_count,
+                created_at: serialized.created_at,
+                limits,
             };
 
             scheduler.schedules.insert(serialized.id.clone(), schedule);
@@ -854,13 +1253,140 @@ impl<F: Fn(TickEvent) + Send + Sync + Clone + 'static> CallbackHandler for Closu
 
 // ----------------- SECTION 5: Builder APIs -----------------
 
-/// Builder for creating schedules.
-pub struct ScheduleBuilder<'a> {
-    scheduler: &'a mut Scheduler,
-    duration: Duration,
+/// Schedulable can be used to create schedules in a fluent way
+/// without needing a mutable reference to a Scheduler instance
+#[derive(Clone)]
+pub struct ScheduleDefinition {
+    schedule_type: ScheduleType,
     name: Option<String>,
     callback_id: Option<String>,
     event_buses: Vec<String>,
+    limits: ScheduleLimits,
+}
+
+impl ScheduleDefinition {
+    /// Create a new schedule definition with a fixed interval
+    pub fn every<T: Into<Duration>>(duration: T) -> Self {
+        Self {
+            schedule_type: ScheduleType::Fixed(duration.into()),
+            name: None,
+            callback_id: None,
+            event_buses: Vec::new(),
+            limits: ScheduleLimits::default(),
+        }
+    }
+
+    /// Set the name for this schedule definition
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Add an additional duration to the schedule interval
+    pub fn plus<T: Into<Duration>>(mut self, additional: T) -> Self {
+        match &mut self.schedule_type {
+            ScheduleType::Fixed(interval) => {
+                *interval += additional.into();
+            }
+            ScheduleType::Jitter { base, .. } => {
+                *base += additional.into();
+            }
+            ScheduleType::Exponential { initial, .. } => {
+                *initial += additional.into();
+            }
+            ScheduleType::Decay {
+                initial, target, ..
+            } => {
+                let add = additional.into();
+                *initial += add;
+                *target += add;
+            }
+        }
+        self
+    }
+
+    /// Set the callback ID for this schedule definition
+    pub fn with_callback_id(mut self, id: impl Into<String>) -> Self {
+        self.callback_id = Some(id.into());
+        self
+    }
+
+    /// Add an event bus to emit events to
+    pub fn emit_to(mut self, bus_id: impl Into<String>) -> Self {
+        self.event_buses.push(bus_id.into());
+        self
+    }
+
+    /// Add random jitter to the schedule
+    pub fn with_jitter<T: Into<Duration>>(mut self, jitter: T) -> Self {
+        let jitter_duration = jitter.into();
+
+        // Convert the current schedule type to a jittered one
+        match self.schedule_type {
+            ScheduleType::Fixed(interval) => {
+                self.schedule_type = ScheduleType::Jitter {
+                    base: interval,
+                    jitter: jitter_duration,
+                };
+            }
+            ScheduleType::Jitter { base, .. } => {
+                self.schedule_type = ScheduleType::Jitter {
+                    base,
+                    jitter: jitter_duration,
+                };
+            }
+            _ => {
+                // For other types, use the base interval
+                let base = self.schedule_type.base_interval();
+                self.schedule_type = ScheduleType::Jitter {
+                    base,
+                    jitter: jitter_duration,
+                };
+            }
+        }
+
+        self
+    }
+
+    /// Create an exponential backoff schedule
+    pub fn exponential(mut self, factor: f64, max_interval: Option<Duration>) -> Self {
+        let initial = self.schedule_type.base_interval();
+        self.schedule_type = ScheduleType::Exponential {
+            initial,
+            factor,
+            max: max_interval,
+        };
+        self
+    }
+
+    /// Create a decaying schedule that changes from the initial interval to the target
+    pub fn decay_to<T: Into<Duration>>(mut self, target: T, half_life: T) -> Self {
+        let initial = self.schedule_type.base_interval();
+        self.schedule_type = ScheduleType::Decay {
+            initial,
+            target: target.into(),
+            half_life: half_life.into(),
+        };
+        self
+    }
+
+    /// Limit the schedule to a maximum number of executions
+    pub fn max_executions(mut self, count: u64) -> Self {
+        self.limits.max_executions = Some(count);
+        self
+    }
+
+    /// Limit the schedule to a maximum total runtime
+    pub fn max_runtime<T: Into<Duration>>(mut self, duration: T) -> Self {
+        self.limits.max_runtime = Some(duration.into());
+        self
+    }
+}
+
+/// Builder for creating schedules.
+pub struct ScheduleBuilder<'a> {
+    scheduler: &'a mut Scheduler,
+    definition: ScheduleDefinition,
 }
 
 impl<'a> ScheduleBuilder<'a> {
@@ -868,34 +1394,61 @@ impl<'a> ScheduleBuilder<'a> {
     pub fn new(scheduler: &'a mut Scheduler, duration: Duration) -> Self {
         ScheduleBuilder {
             scheduler,
-            duration,
-            name: None,
-            callback_id: None,
-            event_buses: Vec::new(),
+            definition: ScheduleDefinition::every(duration),
         }
     }
 
     /// Set the name for this schedule.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
-        self.name = Some(name.into());
+        self.definition = self.definition.with_name(name);
         self
     }
 
     /// Add an additional duration to the schedule interval.
     pub fn plus<T: Into<Duration>>(mut self, additional: T) -> Self {
-        self.duration += additional.into();
+        self.definition = self.definition.plus(additional);
         self
     }
 
     /// Set the callback ID for this schedule.
     pub fn with_callback_id(mut self, id: impl Into<String>) -> Self {
-        self.callback_id = Some(id.into());
+        self.definition = self.definition.with_callback_id(id);
         self
     }
 
     /// Add an event bus to emit events to.
     pub fn emit_to(mut self, bus_id: impl Into<String>) -> Self {
-        self.event_buses.push(bus_id.into());
+        self.definition = self.definition.emit_to(bus_id);
+        self
+    }
+
+    /// Add random jitter to the schedule.
+    pub fn with_jitter<T: Into<Duration>>(mut self, jitter: T) -> Self {
+        self.definition = self.definition.with_jitter(jitter);
+        self
+    }
+
+    /// Create an exponential backoff schedule.
+    pub fn exponential(mut self, factor: f64, max_interval: Option<Duration>) -> Self {
+        self.definition = self.definition.exponential(factor, max_interval);
+        self
+    }
+
+    /// Create a decaying schedule that changes from the initial interval to the target.
+    pub fn decay_to<T: Into<Duration>>(mut self, target: T, half_life: T) -> Self {
+        self.definition = self.definition.decay_to(target, half_life);
+        self
+    }
+
+    /// Limit the schedule to a maximum number of executions.
+    pub fn max_executions(mut self, count: u64) -> Self {
+        self.definition = self.definition.max_executions(count);
+        self
+    }
+
+    /// Limit the schedule to a maximum total runtime.
+    pub fn max_runtime<T: Into<Duration>>(mut self, duration: T) -> Self {
+        self.definition = self.definition.max_runtime(duration);
         self
     }
 
@@ -936,21 +1489,7 @@ impl<'a> ScheduleBuilder<'a> {
 
     /// Build the schedule and add it to the scheduler.
     pub fn build(self) -> Result<String, SchedulerError> {
-        let id = Uuid::new_v4().to_string();
-        let name = self.name.unwrap_or_else(|| format!("schedule_{}", id));
-
-        let schedule = Schedule {
-            id: id.clone(),
-            name,
-            interval: self.duration,
-            next_execution: None,
-            callback_id: self.callback_id,
-            event_buses: self.event_buses,
-        };
-
-        self.scheduler.schedules.insert(id.clone(), schedule);
-
-        Ok(id)
+        self.scheduler.add_schedule(self.definition)
     }
 }
 
@@ -1005,6 +1544,11 @@ pub mod async_support {
         /// Delegate to inner scheduler for schedule creation.
         pub fn every<T: Into<Duration>>(&mut self, duration: T) -> ScheduleBuilder {
             self.scheduler.every(duration)
+        }
+
+        /// Schedule a pre-defined schedule
+        pub fn schedule(&self, definition: ScheduleDefinition) -> Result<String, SchedulerError> {
+            self.scheduler.schedule(definition)
         }
 
         /// Start the async scheduler.
@@ -1103,6 +1647,7 @@ mod tests {
 
     #[test]
     fn test_schedule_creation() {
+        // Test using Scheduler directly with ScheduleBuilder
         let mut scheduler = Scheduler::new();
         let schedule_id = scheduler
             .every(Duration::from_secs(5))
@@ -1111,31 +1656,366 @@ mod tests {
             .expect("Failed to build schedule");
 
         assert!(scheduler.schedules.contains_key(&schedule_id));
+
+        // Test using ScheduleDefinition
+        let scheduler = Scheduler::new();
+        let definition =
+            ScheduleDefinition::every(Duration::from_secs(5)).with_name("definition_schedule");
+
+        let schedule_id = scheduler
+            .schedule(definition)
+            .expect("Failed to add schedule from definition");
+
+        assert!(scheduler.schedules.contains_key(&schedule_id));
     }
 
     #[test]
-    fn test_serialization() {
+    fn test_jittered_schedule() {
+        // Test with ScheduleBuilder
+        {
+            // Create a scheduler with a fixed seed for deterministic tests
+            let config = SchedulerConfig {
+                thread_count: 2,
+                store_capacity: 10,
+                time_source: None,
+                rng_seed: Some(12345),
+            };
+
+            let mut scheduler = Scheduler::with_config(config);
+
+            // Build a jittered schedule
+            let schedule_id = scheduler
+                .every(Duration::from_secs(1))
+                .with_name("jittered_test")
+                .with_jitter(Duration::from_millis(500))
+                .build()
+                .expect("Failed to build schedule");
+
+            let schedule = scheduler.get_schedule(&schedule_id).unwrap();
+
+            // Check that the schedule has the expected type
+            match schedule.schedule_type {
+                ScheduleType::Jitter { base, jitter } => {
+                    assert_eq!(base, Duration::from_secs(1));
+                    assert_eq!(jitter, Duration::from_millis(500));
+                }
+                _ => panic!("Expected a jittered schedule"),
+            }
+        }
+
+        // Test with ScheduleDefinition
+        {
+            let scheduler = Scheduler::new();
+
+            // Build a jittered schedule definition
+            let definition = ScheduleDefinition::every(Duration::from_secs(1))
+                .with_name("jittered_definition")
+                .with_jitter(Duration::from_millis(500));
+
+            let schedule_id = scheduler
+                .schedule(definition)
+                .expect("Failed to add schedule from definition");
+
+            let schedule = scheduler.get_schedule(&schedule_id).unwrap();
+
+            // Check that the schedule has the expected type
+            match schedule.schedule_type {
+                ScheduleType::Jitter { base, jitter } => {
+                    assert_eq!(base, Duration::from_secs(1));
+                    assert_eq!(jitter, Duration::from_millis(500));
+                }
+                _ => panic!("Expected a jittered schedule"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_exponential_schedule() {
+        // Test with ScheduleBuilder
+        {
+            let mut scheduler = Scheduler::new();
+
+            // Build an exponential backoff schedule
+            let schedule_id = scheduler
+                .every(Duration::from_secs(1))
+                .with_name("exponential_test")
+                .exponential(2.0, Some(Duration::from_secs(8)))
+                .build()
+                .expect("Failed to build schedule");
+
+            let schedule = scheduler.get_schedule(&schedule_id).unwrap();
+
+            // Check that the schedule has the expected type
+            match schedule.schedule_type {
+                ScheduleType::Exponential {
+                    initial,
+                    factor,
+                    max,
+                } => {
+                    assert_eq!(initial, Duration::from_secs(1));
+                    assert_eq!(factor, 2.0);
+                    assert_eq!(max, Some(Duration::from_secs(8)));
+                }
+                _ => panic!("Expected an exponential schedule"),
+            }
+        }
+
+        // Test with ScheduleDefinition
+        {
+            let scheduler = Scheduler::new();
+
+            // Build an exponential backoff schedule definition
+            let definition = ScheduleDefinition::every(Duration::from_secs(1))
+                .with_name("exponential_definition")
+                .exponential(2.0, Some(Duration::from_secs(8)));
+
+            let schedule_id = scheduler
+                .schedule(definition)
+                .expect("Failed to add schedule from definition");
+
+            let schedule = scheduler.get_schedule(&schedule_id).unwrap();
+
+            // Check that the schedule has the expected type
+            match schedule.schedule_type {
+                ScheduleType::Exponential {
+                    initial,
+                    factor,
+                    max,
+                } => {
+                    assert_eq!(initial, Duration::from_secs(1));
+                    assert_eq!(factor, 2.0);
+                    assert_eq!(max, Some(Duration::from_secs(8)));
+                }
+                _ => panic!("Expected an exponential schedule"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_decay_schedule() {
+        // Test with ScheduleBuilder
+        {
+            let mut scheduler = Scheduler::new();
+
+            // Build a decay schedule
+            let schedule_id = scheduler
+                .every(Duration::from_secs(1))
+                .with_name("decay_test")
+                .decay_to(Duration::from_secs(10), Duration::from_secs(5))
+                .build()
+                .expect("Failed to build schedule");
+
+            let schedule = scheduler.get_schedule(&schedule_id).unwrap();
+
+            // Check that the schedule has the expected type
+            match schedule.schedule_type {
+                ScheduleType::Decay {
+                    initial,
+                    target,
+                    half_life,
+                } => {
+                    assert_eq!(initial, Duration::from_secs(1));
+                    assert_eq!(target, Duration::from_secs(10));
+                    assert_eq!(half_life, Duration::from_secs(5));
+                }
+                _ => panic!("Expected a decay schedule"),
+            }
+        }
+
+        // Test with ScheduleDefinition
+        {
+            let scheduler = Scheduler::new();
+
+            // Build a decay schedule definition
+            let definition = ScheduleDefinition::every(Duration::from_secs(1))
+                .with_name("decay_definition")
+                .decay_to(Duration::from_secs(10), Duration::from_secs(5));
+
+            let schedule_id = scheduler
+                .schedule(definition)
+                .expect("Failed to add schedule from definition");
+
+            let schedule = scheduler.get_schedule(&schedule_id).unwrap();
+
+            // Check that the schedule has the expected type
+            match schedule.schedule_type {
+                ScheduleType::Decay {
+                    initial,
+                    target,
+                    half_life,
+                } => {
+                    assert_eq!(initial, Duration::from_secs(1));
+                    assert_eq!(target, Duration::from_secs(10));
+                    assert_eq!(half_life, Duration::from_secs(5));
+                }
+                _ => panic!("Expected a decay schedule"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_execution_limits() {
         let mut scheduler = Scheduler::new();
 
-        // Add a schedule
+        // Create a counter to track executions
+        let counter: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let counter_clone: Arc<AtomicUsize> = Arc::clone(&counter);
+
+        // Create a handler that increments the counter
+        struct CounterHandler {
+            counter: Arc<AtomicUsize>,
+        }
+
+        impl CallbackHandler for CounterHandler {
+            fn handle(&self, _event: TickEvent) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn handle_async<'a>(
+                &'a self,
+                event: TickEvent,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+                Box::pin(async move { self.handle(event) })
+            }
+        }
+
+        // Register the handler
         scheduler
-            .every(Duration::from_secs(10))
-            .with_name("serializable_schedule")
+            .register_callback(
+                "test_counter",
+                Box::new(CounterHandler {
+                    counter: counter_clone,
+                }),
+            )
+            .expect("Failed to register callback");
+
+        // Create a schedule with a max execution limit of 3
+        scheduler
+            .every(Duration::from_millis(10)) // Very short interval for quick test
+            .with_name("limited_schedule")
+            .with_callback_id("test_counter")
+            .max_executions(3)
             .build()
             .expect("Failed to build schedule");
+
+        // Start the scheduler and run it for a bit
+        scheduler.start();
+        thread::sleep(Duration::from_millis(100)); // Should be enough time for max executions
+        scheduler.stop();
+
+        // Check that it executed at most 3 times
+        assert!(
+            counter.load(Ordering::SeqCst) <= 3,
+            "Schedule executed more than its max_executions limit"
+        );
+    }
+
+    #[test]
+    fn test_schedule_plus_method() {
+        let mut scheduler = Scheduler::new();
+
+        // Test plus on fixed schedule
+        let fixed_id = scheduler
+            .every(Duration::from_secs(1))
+            .plus(Duration::from_millis(500))
+            .build()
+            .expect("Failed to build fixed schedule");
+
+        let fixed_schedule = scheduler.get_schedule(&fixed_id).unwrap();
+        match fixed_schedule.schedule_type {
+            ScheduleType::Fixed(interval) => {
+                assert_eq!(
+                    interval,
+                    Duration::from_secs(1) + Duration::from_millis(500)
+                );
+            }
+            _ => panic!("Expected a fixed schedule"),
+        }
+
+        // Test plus on jittered schedule
+        let jitter_id = scheduler
+            .every(Duration::from_secs(1))
+            .with_jitter(Duration::from_millis(200))
+            .plus(Duration::from_millis(500))
+            .build()
+            .expect("Failed to build jittered schedule");
+
+        let jitter_schedule = scheduler.get_schedule(&jitter_id).unwrap();
+        match jitter_schedule.schedule_type {
+            ScheduleType::Jitter { base, jitter } => {
+                assert_eq!(base, Duration::from_secs(1) + Duration::from_millis(500));
+                assert_eq!(jitter, Duration::from_millis(200));
+            }
+            _ => panic!("Expected a jittered schedule"),
+        }
+    }
+
+    #[test]
+    fn test_serialization_with_schedule_types() {
+        let mut scheduler = Scheduler::new();
+
+        // Add different schedule types
+        scheduler
+            .every(Duration::from_secs(1))
+            .with_name("fixed_schedule")
+            .build()
+            .expect("Failed to build fixed schedule");
+
+        scheduler
+            .every(Duration::from_secs(2))
+            .with_jitter(Duration::from_millis(500))
+            .with_name("jittered_schedule")
+            .build()
+            .expect("Failed to build jittered schedule");
+
+        scheduler
+            .every(Duration::from_secs(1))
+            .exponential(2.0, None)
+            .with_name("exponential_schedule")
+            .build()
+            .expect("Failed to build exponential schedule");
+
+        scheduler
+            .every(Duration::from_secs(1))
+            .decay_to(Duration::from_secs(5), Duration::from_secs(10))
+            .with_name("decay_schedule")
+            .build()
+            .expect("Failed to build decay schedule");
 
         // Freeze the state
         let state = scheduler
             .freeze()
             .expect("Failed to freeze scheduler state");
 
-        // Should have one schedule
-        assert_eq!(state.schedules.len(), 1);
-        assert_eq!(state.schedules[0].name, "serializable_schedule");
+        // Should have four schedules
+        assert_eq!(state.schedules.len(), 4);
 
         // Restore and check
         let restored = Scheduler::restore(state).expect("Failed to restore scheduler");
-        assert_eq!(restored.schedules.len(), 1);
+        assert_eq!(restored.schedules.len(), 4);
+
+        // Verify the schedule types were preserved
+        let schedules = restored.get_all_schedules();
+
+        // Count how many of each type we have
+        let mut fixed_count = 0;
+        let mut jitter_count = 0;
+        let mut exponential_count = 0;
+        let mut decay_count = 0;
+
+        for schedule in schedules {
+            match schedule.schedule_type {
+                ScheduleType::Fixed(_) => fixed_count += 1,
+                ScheduleType::Jitter { .. } => jitter_count += 1,
+                ScheduleType::Exponential { .. } => exponential_count += 1,
+                ScheduleType::Decay { .. } => decay_count += 1,
+            }
+        }
+
+        assert_eq!(fixed_count, 1);
+        assert_eq!(jitter_count, 1);
+        assert_eq!(exponential_count, 1);
+        assert_eq!(decay_count, 1);
     }
 
     #[test]
@@ -1143,8 +2023,8 @@ mod tests {
         let mut scheduler = Scheduler::new();
 
         // Create a counter to track executions
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = Arc::clone(&counter);
+        let counter: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let counter_clone: Arc<AtomicUsize> = Arc::clone(&counter);
 
         // Create a handler that increments the counter
         struct CounterHandler {
@@ -1219,10 +2099,13 @@ mod tests {
         let schedule = Schedule {
             id: "test".to_string(),
             name: "Test Schedule".to_string(),
-            interval: Duration::from_secs(10),
+            schedule_type: ScheduleType::Fixed(Duration::from_secs(10)),
             next_execution: None,
             callback_id: None,
             event_buses: Vec::new(),
+            execution_count: 0,
+            created_at: 0,
+            limits: ScheduleLimits::default(),
         };
 
         store.insert("test".to_string(), schedule.clone());
@@ -1269,6 +2152,7 @@ mod tests {
             thread_count: 2,
             store_capacity: 32,
             time_source: None,
+            rng_seed: None,
         };
 
         let mut scheduler = Scheduler::with_config(config);
@@ -1310,8 +2194,8 @@ mod tests {
 
     #[test]
     fn test_callback_fn_helper() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = Arc::clone(&counter);
+        let counter: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let counter_clone: Arc<AtomicUsize> = Arc::clone(&counter);
 
         // Create a handler with the helper function
         let handler = callback_fn(move |_event| {
