@@ -1,4 +1,7 @@
 use rand::prelude::*;
+#[cfg(not(feature = "crypto_rand"))]
+use rand::rngs::StdRng;
+#[cfg(feature = "crypto_rand")]
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
 use std::error::Error;
@@ -365,7 +368,10 @@ pub struct Scheduler {
     running: Arc<AtomicBool>,
     last_tick: Arc<AtomicU64>,
     thread_pool: Arc<ThreadPool>,
+    #[cfg(feature = "crypto_rand")]
     rng: Arc<Mutex<Option<ChaCha8Rng>>>,
+    #[cfg(not(feature = "crypto_rand"))]
+    rng: Arc<Mutex<Option<StdRng>>>,
 }
 
 /// Defines the type of scheduling pattern to use
@@ -541,7 +547,10 @@ impl Scheduler {
         };
 
         // Initialize RNG if a seed is provided
+        #[cfg(feature = "crypto_rand")]
         let rng = config.rng_seed.map(ChaCha8Rng::seed_from_u64);
+        #[cfg(not(feature = "crypto_rand"))]
+        let rng = config.rng_seed.map(StdRng::seed_from_u64);
 
         Scheduler {
             schedules: Arc::new(LockFreeScheduleStore::new()),
