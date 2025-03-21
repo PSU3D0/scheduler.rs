@@ -1150,7 +1150,7 @@ impl std::fmt::Debug for Scheduler {
 ///
 /// # Example
 /// ```
-/// # use schedule_rs::{Scheduler, callback_fn, TickEvent};
+/// # use schedules::{Scheduler, callback_fn, TickEvent};
 /// # use std::time::Duration;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut scheduler = Scheduler::new();

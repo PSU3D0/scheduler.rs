@@ -99,7 +99,7 @@ For asynchronous operation with Tokio (requires the `async` feature):
 ```rust
 // Enable the feature in Cargo.toml:
 // [dependencies]
-// schedule_rs = { version = "0.1.0", features = ["async"] }
+// schedules = { version = "0.2.0", features = ["async"] }
 
 // Create an async scheduler with default settings
 let mut scheduler = AsyncScheduler::new();
