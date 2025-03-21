@@ -10,11 +10,12 @@
 
 This library is perfect for developers who need:
 - 🎯 Simple, predictable scheduling with absolute time intervals
-- 🧩 Lightweight scheduling without complex calendar-based rules
+- 🗓️ Calendar-based scheduling (specific days, times, dates)
 - ⚙️ Precise control over execution timing in systems programming
 - 🔧 Efficient scheduling in resource-constrained environments
+- 🔄 Automatic or manual schedule execution control
 
-By design, we focus on absolute time durations (every 5 seconds, every 10 minutes) and deliberately avoid calendar-based scheduling (every Thursday, first day of month). This keeps the API clean, predictable, and easy to reason about for systems programming tasks.
+The library supports both absolute time durations (every 5 seconds, every 10 minutes) as well as calendar-based scheduling (every Thursday, first day of month, at 3:30 PM). The API is clean, predictable, and easy to reason about for all scheduling tasks.
 
 ## 🎯 Features
 
@@ -25,6 +26,12 @@ By design, we focus on absolute time durations (every 5 seconds, every 10 minute
 - 🔗 Direct callback references and event emission
 - 💾 Easy serialization and state persistence
 - 🔄 Both synchronous AND asynchronous execution support
+- 🗓️ Calendar-based scheduling:
+  - ⏰ Time-of-day scheduling ("3:30 PM", "15:30")
+  - 📆 Day-of-week scheduling (Monday, Tuesday, etc.)
+  - 📅 Day-of-month scheduling (1st, 15th day of month)
+  - 🌙 Month-specific scheduling (January, February, etc.)
+  - 🔀 Multiple time/day combinations
 - 🔀 Advanced scheduling patterns:
   - ⏱️ Jittered intervals (add randomness to prevent thundering herds)
   - 📈 Exponential backoff with configurable rate and maximum
@@ -34,6 +41,7 @@ By design, we focus on absolute time durations (every 5 seconds, every 10 minute
   - 🧵 Worker thread pool size
   - 🧮 Schedule store pre-allocation
   - 🎲 Deterministic operation with fixed RNG seeds
+  - 🔄 Automatic or manual execution modes
 
 ## 🚀 Usage
 
@@ -43,10 +51,11 @@ let mut scheduler = Scheduler::new();
 
 // Or create with custom configuration
 let config = SchedulerConfig {
-    thread_count: 8,              // Use 8 worker threads
-    store_capacity: 100,          // Pre-allocate for 100 schedules
-    time_source: None,            // Use default time source
-    rng_seed: Some(12345),        // Deterministic jitter with fixed seed
+    thread_count: 8,                           // Use 8 worker threads
+    store_capacity: 100,                       // Pre-allocate for 100 schedules
+    time_source: None,                         // Use default time source
+    rng_seed: Some(12345),                     // Deterministic jitter with fixed seed
+    timezone: Some(FixedOffset::east(3600)),   // For calendar scheduling (UTC+1)
 };
 let mut scheduler = Scheduler::with_config(config);
 
@@ -131,6 +140,123 @@ restored.register_callback("log_handler", Box::new(LogHandler))?;
 restored.start();
 ```
 
+## 🗓️ Calendar-Based Scheduling
+
+```rust
+// Create a scheduler
+let mut scheduler = Scheduler::new();
+
+// Register our handler
+scheduler.register_callback("log_handler", Box::new(LogHandler))?;
+
+// Schedule at a specific time each day (24-hour format)
+scheduler
+    .at("15:30")?
+    .with_name("daily_afternoon_check")
+    .with_callback_id("log_handler")
+    .build()?;
+
+// Schedule at a specific time each day (12-hour format)
+scheduler
+    .at("3:30 PM")?
+    .with_name("daily_afternoon_check_12h")
+    .with_callback_id("log_handler")
+    .build()?;
+
+// Schedule for specific days of the week
+scheduler
+    .on(MONDAY)
+    .on_days(&[WEDNESDAY, FRIDAY]) // Add more days
+    .at("10:00 AM")?
+    .with_name("mwf_morning_check")
+    .with_callback_id("log_handler")
+    .build()?;
+
+// Schedule for all weekdays
+scheduler
+    .at("9:00 AM")?
+    .on_weekdays()
+    .with_name("daily_standup")
+    .with_callback_id("log_handler")
+    .build()?;
+
+// Schedule for a specific day of the month
+scheduler
+    .at("12:00")?
+    .on_day_of_month(15)?
+    .with_name("mid_month_report")
+    .with_callback_id("log_handler")
+    .build()?;
+
+// Start the scheduler (automatic execution)
+scheduler.start();
+```
+
+## 🔄 Manual Execution Mode
+
+```rust
+// Create a scheduler with manual execution mode
+let mut scheduler = Scheduler::new_manual();
+
+// Register handlers and define schedules as usual
+scheduler.register_callback("log_handler", Box::new(LogHandler))?;
+
+scheduler
+    .at("3:30 PM")?
+    .with_name("afternoon_check")
+    .with_callback_id("log_handler")
+    .build()?;
+
+scheduler
+    .every(Duration::from_secs(300))
+    .with_name("five_minute_check")
+    .with_callback_id("log_handler")
+    .build()?;
+
+// Instead of starting the scheduler, periodically call run_pending()
+loop {
+    // Check for and execute due schedules
+    let executed_count = scheduler.run_pending()?;
+    println!("Executed {} schedules", executed_count);
+    
+    // Wait for some time before checking again
+    std::thread::sleep(Duration::from_secs(1));
+}
+```
+
+Manual execution also works with async schedulers:
+
+```rust
+// Create an async scheduler with manual execution mode
+let mut scheduler = AsyncScheduler::new_manual();
+
+// Register async handlers and define schedules
+scheduler.register_async_handler("async_handler", |event| async move {
+    println!("Async handling of event: {:?}", event);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+})?;
+
+scheduler
+    .at("3:30 PM")?
+    .with_name("async_afternoon_task")
+    .with_callback_id("async_handler")
+    .build()?;
+
+// Use within an async runtime
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut scheduler = AsyncScheduler::new_manual();
+    // ... configure scheduler ...
+    
+    // Periodically call run_pending in your async context
+    loop {
+        let executed_count = scheduler.run_pending().await?;
+        println!("Executed {} async schedules", executed_count);
+        
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+```
+
 ## ⚡ Async Support
 
 For asynchronous operation with Tokio (requires the `async` feature):
@@ -148,7 +274,8 @@ let config = SchedulerConfig {
     thread_count: 8,
     store_capacity: 100,
     time_source: None,
-    rng_seed: Some(12345),  // For deterministic behavior
+    rng_seed: Some(12345),                     // For deterministic behavior
+    timezone: Some(FixedOffset::east(3600)),   // For calendar scheduling (UTC+1)
 };
 let mut scheduler = AsyncScheduler::with_config(config);
 
@@ -175,6 +302,17 @@ scheduler
         println!("Completed inline async task: {}", event.schedule_name);
     })?;
 
+// Calendar-based async scheduling
+scheduler
+    .at("9:00 AM")?
+    .on_weekdays()
+    .with_name("morning_async_task")
+    .execute(|event| async move {
+        println!("Starting morning task: {}", event.schedule_name);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        println!("Completed morning task: {}", event.schedule_name);
+    })?;
+
 scheduler.start();
 ```
 
@@ -184,10 +322,13 @@ Add to your Cargo.toml:
 
 ```toml
 [dependencies]
-schedules = "0.3.0"
+schedules = "0.4.0"
 
 # For async support:
-schedules = { version = "0.3.0", features = ["async"] }
+schedules = { version = "0.4.0", features = ["async"] }
+
+# For all features including calendar scheduling and manual execution:
+schedules = { version = "0.4.0", features = ["async", "calendar"] }
 ```
 
 ## 📄 License
